@@ -15,7 +15,6 @@ import java.util.List;
 
 /**
  * Contains image processing pipelines (preview and acquisition) and helpers to load simulation TIFFs.
- * This preserves your algorithms exactly from the original code.
  */
 public class LocalizationProcessor {
 

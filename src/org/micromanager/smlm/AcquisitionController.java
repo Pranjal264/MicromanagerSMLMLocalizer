@@ -26,10 +26,7 @@ import org.apache.commons.math3.complex.Complex;
  * AcquisitionController - handles preview and acquisition loop.
  * - Peak detection on processed image (bg-subtracted + smoothed)
  * - Subpixel phasor localization on raw ROI
- *
- * Updated to:
- *  - save multipage TIFFs using ImageJ ImageStack (no OME metadata)
- *  - provide progress updates + ETA via ProgressListener
+ * - save multipage TIFFs using ImageJ ImageStack or single TIFF images
  */
 public class AcquisitionController {
 
@@ -41,6 +38,7 @@ public class AcquisitionController {
     private Thread acqThread = null;
 
     private ImagePlus livePreviewImp = null;
+    private final Object livePreviewLock = new Object(); // lock for preview handling
 
     private volatile ProgressListener progressListener = null;
 
@@ -88,7 +86,7 @@ public class AcquisitionController {
 
                 // show RAW image in preview with overlays
                 FloatProcessor rawDisplay = createDisplayFromRaw(image);
-                ImagePlus previewImp = new ImagePlus("Preview (raw)", rawDisplay);
+                ImagePlus previewImp = new ImagePlus("Preview", rawDisplay);
 
                 Overlay ov = new Overlay();
                 int r = Math.max(1, params.roiSize / 2);
@@ -116,6 +114,8 @@ public class AcquisitionController {
 
     public void requestStop() {
         stopRequested = true;
+        // attempt to close preview promptly when the user clicks Stop
+        closeLivePreview();
         if (acqThread != null) {
             try { acqThread.join(200); } catch (InterruptedException ignored) {}
         }
@@ -143,7 +143,6 @@ public class AcquisitionController {
         try {
             if (studio != null) {
                 studio.core().setExposure(exposureMs);
-                studio.logs().showMessage("Exposure set to " + exposureMs + " ms");
             }
 
             if (saveStack && outDir != null) {
@@ -242,7 +241,7 @@ public class AcquisitionController {
                         stack.addSlice(String.format("f%06d", f), sp);
                         savedFilename = "frames_stack.tif"; // will be written at the end
                     } else {
-                        // per-frame TIFF (existing behavior)
+                        // per-frame TIFF
                         String fname = String.format("frame_%06d.tif", f);
                         FloatProcessor fp = new FloatProcessor(w, h);
                         for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) fp.setf(xx, yy, (float) image[yy][xx]);
@@ -269,23 +268,28 @@ public class AcquisitionController {
                 if (previewDuring) {
                     final FloatProcessor rawDisplay = createDisplayFromRaw(image);
                     final List<int[]> peaksCopy = new ArrayList<>(peaks);
+
+                    // Show/update the ImagePlus (creates a new window if previous was closed)
+                    showOrUpdateLivePreview(rawDisplay);
+
+                    // Update overlays on EDT (queued after the above show/update)
                     SwingUtilities.invokeLater(() -> {
-                        if (livePreviewImp == null) {
-                            livePreviewImp = new ImagePlus("Live preview", rawDisplay);
-                            livePreviewImp.show();
-                        } else {
-                            livePreviewImp.setProcessor(rawDisplay);
+                        try {
+                            // If livePreviewImp was recreated above it will be non-null and have a window.
+                            if (livePreviewImp == null) return;
+                            Overlay ov = new Overlay();
+                            int r = Math.max(1, params.roiSize / 2);
+                            for (int[] pxy : peaksCopy) {
+                                int px = pxy[0], py = pxy[1];
+                                OvalRoi or = new OvalRoi(px - r, py - r, 2 * r + 1, 2 * r + 1);
+                                or.setStrokeColor(java.awt.Color.RED);
+                                ov.add(or);
+                            }
+                            livePreviewImp.setOverlay(ov);
+                            try { livePreviewImp.updateAndDraw(); } catch (Exception ignore) {}
+                        } catch (Throwable t) {
+                            if (studio != null) studio.logs().showError("Overlay update error: " + t.getMessage());
                         }
-                        Overlay ov = new Overlay();
-                        int r = Math.max(1, params.roiSize / 2);
-                        for (int[] pxy : peaksCopy) {
-                            int px = pxy[0], py = pxy[1];
-                            OvalRoi or = new OvalRoi(px - r, py - r, 2 * r + 1, 2 * r + 1);
-                            or.setStrokeColor(java.awt.Color.RED);
-                            ov.add(or);
-                        }
-                        livePreviewImp.setOverlay(ov);
-                        livePreviewImp.updateAndDraw();
                     });
                 }
 
@@ -332,6 +336,8 @@ public class AcquisitionController {
         } finally {
             // ensure progress UI closed
             if (progressListener != null) progressListener.closeProgress();
+            // ensure preview closed / cleared
+            closeLivePreview();
             stopRequested = false;
         }
     }
@@ -371,7 +377,6 @@ public class AcquisitionController {
 
     /**
      * Detection on processed image (bg-subtracted + smoothed).
-     * (copied from original code)
      */
     private ProcessedResult processForPeaks(double[][] image, double bgSigma, double smoothSigma,
                                             int minPeakDistance, double peakThreshold, int roiSize) {
@@ -448,7 +453,6 @@ public class AcquisitionController {
 
     /**
      * Phasor localization on raw image ROI.
-     * (copied from your original code)
      */
     private List<Localization> localizePeaksOnRaw(double[][] image, List<int[]> peaks, int roiSize, int frameNumber) {
         List<Localization> locs = new ArrayList<>();
@@ -496,7 +500,7 @@ public class AcquisitionController {
         return locs;
     }
 
-    // ... helper methods retained below (createDisplayFromRaw, convertToLEU16 removed/not used here) ...
+    // helper methods 
 
     /**
      * Normalize raw image for display (min..max -> 0..255).
@@ -520,6 +524,49 @@ public class AcquisitionController {
             fp.setf(x, y, val);
         }
         return fp;
+    }
+
+    /**
+     * Show or update the live preview ImagePlus on the EDT.
+     */
+    private void showOrUpdateLivePreview(final FloatProcessor rawDisplay) {
+        synchronized (livePreviewLock) {
+            SwingUtilities.invokeLater(() -> {
+                try {
+                    // if no ImagePlus or its window was closed, create+show a fresh one
+                    if (livePreviewImp == null || livePreviewImp.getWindow() == null) {
+                        livePreviewImp = new ImagePlus("Live preview", rawDisplay);
+                        livePreviewImp.show();
+                    } else {
+                        // update processor and redraw
+                        livePreviewImp.setProcessor(rawDisplay);
+                        try { livePreviewImp.updateAndDraw(); } catch (Exception ignore) {}
+                    }
+                } catch (Throwable t) {
+                    // Defensive logging so preview issues don't kill acquisition
+                    if (studio != null) studio.logs().showError("Preview window error: " + t.getMessage());
+                }
+            });
+        }
+    }
+
+    /**
+     * Close and clear the live preview (safe to call from worker thread).
+     */
+    private void closeLivePreview() {
+        synchronized (livePreviewLock) {
+            final ImagePlus imp = livePreviewImp;
+            if (imp != null) {
+                SwingUtilities.invokeLater(() -> {
+                    try {
+                        if (imp.getWindow() != null) {
+                            imp.getWindow().close();
+                        }
+                    } catch (Throwable ignore) {}
+                });
+            }
+            livePreviewImp = null;
+        }
     }
 
     // CSV row holder

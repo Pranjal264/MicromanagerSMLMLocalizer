@@ -30,7 +30,7 @@ public class SMLMLocalizer implements MenuPlugin, SciJavaPlugin {
         // Create processor & accumulator
         LocalizationProcessor processor = new LocalizationProcessor();
         LocalizationAccumulator accumulator = new LocalizationAccumulator();
-        // create UI (UI doesn't need Studio) first, so we can wire progress listener
+
         this.ui_ = new SMLMLocalizerUI();
         // create controller with Studio and wire UI as progress listener
         this.acqController_ = new AcquisitionController(studio_, processor, accumulator);
