@@ -22,4 +22,10 @@ public interface ProgressListener {
      * Called when acquisition finishes or aborts (worker thread).
      */
     void closeProgress();
+    
+    /** Called immediately when the Camera loop finishes */
+    void onCameraFinished();
+
+    /** Updates the UI with the current size of the processing queue */
+    void onQueueStatus(int pendingCount);
 }

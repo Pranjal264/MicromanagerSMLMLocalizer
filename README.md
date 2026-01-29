@@ -22,12 +22,12 @@ It provides:
 
 ## Requirements
 
-- Micro-Manager 2.0 (plugin discovery via SciJava)  
-- Java 1.8 (the JDK used by your Micro-Manager distribution)  
+- Micro-Manager 2.0 (tested on 2.0 stable as well as 2.0.3 nightly versions on 29 Jan 2026)  
+- Java 1.8 (the JDK used by Micro-Manager)  
 - NetBeans (you can use any IDE but instructions below assume NetBeans + Ant)  
 - Dependencies (add these jars to your micromanager install directory \ plugins \Micro-Manager):
-  - [JTransforms] (for FFT) - `JTransforms-3.*.jar` 
-  - [JLargeArrays] (for large arrays) -  `JLargeArrays-1.*.jar`
+  - [JTransforms](https://mvnrepository.com/artifact/com.github.wendykierp/JTransforms/3.1) - `JTransforms-3.*.jar` 
+  - [JLargeArrays](https://mvnrepository.com/artifact/pl.edu.icm/JLargeArrays/1.5) -  `JLargeArrays-1.*.jar`
 
 > Note: the plugin uses SciJava annotations. Make sure annotation processing is enabled in your NetBeans/Ant build so plugin metadata is generated.
 
@@ -36,7 +36,7 @@ It provides:
 ## Build & Install (NetBeans + Ant)
 
 1. **Project setup**
-   - CLone the repositiory. There is a Netbeans +Ant project within.
+   - CLone the repositiory. There is a Netbeans + Ant project within.
    - If there are issues, create a Java project in NetBeans using Ant.
    - Follow the instructions provided at [Micromanager website](https://micro-manager.org/Using_Netbeans)
    - Ensure annotation processing is enabled (NetBeans -> Project Properties -> Annotation Processors -> Enable).
@@ -65,13 +65,13 @@ It provides:
 
 ---
 
-## Configuration notes & troubleshooting
+<!-- ## Configuration notes & troubleshooting
 
 - **ROI handling**: If you select an ROI in the Micro-Manager main GUI, the plugin will receive frames sized to that ROI (`core.getImageWidth()` / `core.getImageHeight()`), so you can tune parameters on your chosen ROI.
 - **Multipage TIFF memory usage**: The multipage TIFF mode currently collects frames in an `ImageStack` and writes the TIFF at the end. For very large numbers of frames or very large frame sizes this may use a lot of memory. If you need streaming (append-as-you-go) saving, open an issue and we can add a streaming writer.
 - **Bio-Formats / OME**: This plugin intentionally saves a plain multipage TIFF (no OME metadata). If you require OME metadata and Bio-Formats writing, we can add a BF writer mode - but you may need to address metadata configuration (sizeX/sizeY/sizeT etc.).
 - **If saving fails**: check that the output folder is writable and that you have enough free disk space. The plugin logs messages to Micro-Manager's logs panel.
-- **CSV format**: `localizations.csv` contains `Frame,Amplitude,X,Y` columns (no image filenames by default).
+- **CSV format**: `localizations.csv` contains `Frame,Amplitude,X,Y` columns. -->
 
 ---
 
@@ -91,6 +91,6 @@ This repository is released under the **BSD 3-Clause License**. See [LICENSE](./
 
 ## Author / Citation
 
-Pranjal Choudhury - SMLM plugin (2025)  
-If you use this plugin in published work, please cite it (include plugin name and version) or open an issue and request a suggested citation format.
+Pranjal Choudhury - SMLM plugin (2026)  
+<!-- If you use this plugin in published work, please cite it or open an issue and request a suggested citation format. -->
 

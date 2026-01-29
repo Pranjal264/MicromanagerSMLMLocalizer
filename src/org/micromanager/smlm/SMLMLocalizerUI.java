@@ -28,6 +28,7 @@ public class SMLMLocalizerUI implements ProgressListener {
     private JButton startBtn_;
     private JButton stopBtn_;
     private JButton clearBtn_;
+    private JLabel queueLabel_;
 
     // NEW controls
     private JRadioButton saveMultiPageRB_;
@@ -212,6 +213,22 @@ public class SMLMLocalizerUI implements ProgressListener {
         progressBar_ = new JProgressBar(0, 100);
         progressBar_.setStringPainted(true);
         etaLabel_ = new JLabel("ETA: -");
+        
+        queueLabel_ = new JLabel("Queue: 0");
+        queueLabel_.setFont(queueLabel_.getFont().deriveFont(10f)); // Make it slightly smaller
+        queueLabel_.setForeground(java.awt.Color.GRAY);
+
+        JPanel statusRight = new JPanel(new GridLayout(2, 1));
+        statusRight.add(etaLabel_);
+        statusRight.add(queueLabel_);
+
+        progressPanel_.add(progressBar_, BorderLayout.CENTER);
+        progressPanel_.add(statusRight, BorderLayout.EAST); // Add the combined label panel
+
+        frame_.add(p, BorderLayout.CENTER);
+        frame_.add(progressPanel_, BorderLayout.SOUTH);
+        
+        
         progressPanel_.add(progressBar_, BorderLayout.CENTER);
         progressPanel_.add(etaLabel_, BorderLayout.EAST);
 
@@ -327,6 +344,26 @@ public class SMLMLocalizerUI implements ProgressListener {
             progressBar_.setIndeterminate(false);
             progressBar_.setValue(progressBar_.getMaximum());
             etaLabel_.setText("ETA: done");
+        });
+    }
+    
+    @Override
+    public void onCameraFinished() {
+        SwingUtilities.invokeLater(() -> {
+            JOptionPane.showMessageDialog(frame_, 
+                "Camera Acquisition Finished!\nProcessing remaining frames...", 
+                "Acquisition Status", 
+                JOptionPane.INFORMATION_MESSAGE);
+        });
+    }
+
+    @Override
+    public void onQueueStatus(int pendingCount) {
+        SwingUtilities.invokeLater(() -> {
+            queueLabel_.setText("Queue: " + pendingCount);
+            // Optional: Turn red if queue is getting full (e.g., > 80)
+            if (pendingCount > 80) queueLabel_.setForeground(java.awt.Color.RED);
+            else queueLabel_.setForeground(java.awt.Color.GRAY);
         });
     }
 }

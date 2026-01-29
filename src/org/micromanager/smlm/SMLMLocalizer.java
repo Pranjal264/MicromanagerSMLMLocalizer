@@ -74,12 +74,12 @@ public class SMLMLocalizer implements MenuPlugin, SciJavaPlugin {
 
     @Override
     public String getVersion() {
-        return "0.2 ";
+        return "0.3 ";
     }
 
     @Override
     public String getCopyright() {
-        return "(c) Pranjal Choudhury 2025";
+        return "(c) Pranjal Choudhury 2026";
     }
 
     @Override
