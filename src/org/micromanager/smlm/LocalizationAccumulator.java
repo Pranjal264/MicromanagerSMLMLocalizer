@@ -2,6 +2,7 @@ package org.micromanager.smlm;
 
 import ij.ImagePlus;
 import ij.process.FloatProcessor;
+import ij.plugin.ContrastEnhancer;
 
 import javax.swing.*;
 import java.util.List;
@@ -102,8 +103,11 @@ public class LocalizationAccumulator {
                     cumulativeImp.updateAndDraw();
                 }
                 try {
-                    cumulativeImp.getProcessor().setMinAndMax(0, Math.max(1.0, vmax));
+//                    cumulativeImp.getProcessor().setMinAndMax(0, Math.max(1.0, vmax));
+//                    cumulativeImp.getProcessor().resetMinAndMax();
+                    new ContrastEnhancer().stretchHistogram(cumulativeImp, 0.5);
                 } catch (Exception ignore) {}
+                cumulativeImp.updateAndDraw();
             });
         }
     }

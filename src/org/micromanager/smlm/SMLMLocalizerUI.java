@@ -30,7 +30,6 @@ public class SMLMLocalizerUI implements ProgressListener {
     private JButton clearBtn_;
     private JLabel queueLabel_;
 
-    // NEW controls
     private JRadioButton saveMultiPageRB_;
     private JRadioButton savePerFrameRB_;
     private JCheckBox previewDuringAcqCB_;
@@ -307,7 +306,7 @@ public class SMLMLocalizerUI implements ProgressListener {
         return head + "..." + tail;
     }
 
-    // ----- ProgressListener implementation (thread-safe UI updates) -----
+    //  ProgressListener implementation
 
     @Override
     public void initProgress(int totalFrames) {

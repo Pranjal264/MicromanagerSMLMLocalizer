@@ -107,7 +107,7 @@ public class LocalizationProcessor {
         return new ProcessResult(displayFP, peaks, new ArrayList<>());
     }
 
-    // ----- Acquisition processing (full localization) -----
+    //  Acquisition processing (full localization) 
     public List<Localization> processImageForAcquisition(double[][] image, int frameNumber,
                                                         double backgroundSigma, double smoothingSigma,
                                                         int minPeakDistance, double peakThreshold,
@@ -206,7 +206,7 @@ public class LocalizationProcessor {
         return locs;
     }
 
-    // ----- helper methods for simulation file listing and loading -----
+    //  helper methods for simulation file listing and loading 
     public String[] getTiffFileList(String folder) {
         try {
             File dir = new File(folder);
