@@ -5,6 +5,7 @@ import ij.ImageStack;
 import ij.io.FileSaver;
 import ij.gui.OvalRoi;
 import ij.gui.Overlay;
+import ij.process.ByteProcessor;
 import ij.process.FloatProcessor;
 import ij.process.ShortProcessor;
 import org.micromanager.Studio;
@@ -15,10 +16,15 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -32,11 +38,21 @@ public class AcquisitionController {
 
     private volatile boolean stopRequested = false;
     private Thread acqThread = null;
-    private Thread processThread = null;
+    private final List<Thread> processThreads = new ArrayList<>();
+
+    // Number of worker threads that pull frames off the processing queue and
+    // localize them concurrently. One whole frame per thread -> no tiling,
+    // no boundary effects. Leave one core free for acquisition/UI/JVM.
+    private static final int NUM_PROCESS_THREADS =
+            Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
 
     private ImagePlus livePreviewImp = null;
     private final Object livePreviewLock = new Object();
     private volatile ProgressListener progressListener = null;
+
+    // frames the camera delivered that could not be queued for localization (processing too slow)
+    private final AtomicInteger droppedFrames = new AtomicInteger(0);
+    private final AtomicBoolean errorShown = new AtomicBoolean(false);
 
     private long acqStartTimeNs = 0L;
     private double avgFrameMs = 0.0;
@@ -117,27 +133,59 @@ public class AcquisitionController {
         stopRequested = true;
         closeLivePreview();
         try { if (studio != null) studio.core().stopSequenceAcquisition(); } catch (Exception ignored) {}
-        if (acqThread != null) try { acqThread.join(200); } catch (Exception ignored) {}
-        if (processThread != null) try { processThread.join(200); } catch (Exception ignored) {}
+        // No joins here: this is called on the EDT. The worker threads drain the queue and
+        // finish on their own; finalizeAcquisition() then re-enables the buttons.
     }
 
     private void runProducerConsumerAcquisition(AcquisitionParameters params) {
+        // Each run gets a timestamped child directory: YYYYMMDD_HH_mm.
+        if (params.outDir != null && (params.saveStack || params.saveCsv || params.saveReconstruction)) {
+            String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HH_mm", Locale.ROOT));
+            File runDir = new File(params.outDir, stamp);
+            if (!runDir.exists() && !runDir.mkdirs()) {
+                showError("Could not create timestamped output folder: " + runDir.getAbsolutePath());
+                if (progressListener != null) progressListener.closeProgress();
+                return;
+            }
+            params.outDir = runDir.getAbsolutePath();
+        }
         // Queue size 100 is good for 512x512. Decrease if full chip.
         BlockingQueue<AcqFrame> processingQueue = new LinkedBlockingQueue<>(100);
-        
-        List<LocalizationCsvRow> csvRows = new ArrayList<>();
+
+        // Multiple threads append to this concurrently -> must be thread-safe.
+        // (Frame number is stored per-row, so out-of-order completion is fine.)
+        List<LocalizationCsvRow> csvRows = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger producerStatus = new AtomicInteger(0);
 
-        processThread = new Thread(() -> 
-            runProcessingLoop(processingQueue, csvRows, params, producerStatus), 
-            "SMLM-Proc-Thread"
-        );
-        processThread.start();
+        droppedFrames.set(0);
+        errorShown.set(false);
+        avgFrameMs = 0.0;
+        accumulator.beginAcquisition();   // fresh reconstruction for every run
 
-        runAcquisitionLoop(processingQueue, params, producerStatus);
+        processThreads.clear();
+        for (int i = 0; i < NUM_PROCESS_THREADS; i++) {
+            Thread t = new Thread(() ->
+                runProcessingLoop(processingQueue, csvRows, params, producerStatus),
+                "SMLM-Proc-Thread-" + i
+            );
+            processThreads.add(t);
+            t.start();
+        }
 
-        try { processThread.join(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        finalizeAcquisition(csvRows, params);
+        try {
+            runAcquisitionLoop(processingQueue, params, producerStatus);
+        } finally {
+            // never leave the consumers waiting on a producer that died unexpectedly
+            producerStatus.compareAndSet(0, 2);
+        }
+
+        try {
+            for (Thread t : processThreads) {
+                try { t.join(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+        } finally {
+            finalizeAcquisition(csvRows, params);
+        }
     }
 
     /**
@@ -147,17 +195,20 @@ public class AcquisitionController {
                                     AcquisitionParameters params, 
                                     AtomicInteger status) {
         ImageStack stack = null;
-        boolean stackingEnabled = false;
-        boolean wantMultipage = params.saveMultipage;
-        boolean wantPerFrame = params.saveSingleFiles;
+        boolean stackingEnabled = params.saveStack;
+        boolean wantMultipage = true;
+        boolean wantPerFrame = false; // output contract: always save one stack.tif
         
-        if (params.saveStack && params.outDir != null) {
+        boolean anySave = params.saveStack || params.saveCsv || params.saveReconstruction;
+        if (anySave && params.outDir != null) {
             File d = new File(params.outDir);
             if (!d.exists() && !d.mkdirs()) {
                 showError("Failed to create output directory");
                 status.set(2); return;
             }
-            if (wantMultipage && !wantPerFrame) stackingEnabled = true;
+        }
+        if (params.saveStack && params.outDir != null && wantMultipage && !wantPerFrame) {
+            stackingEnabled = true;
         }
 
         String[] simFiles = null;
@@ -218,7 +269,7 @@ public class AcquisitionController {
                     if (params.saveStack && params.outDir != null) {
                         if (stackingEnabled && stack != null) {
                             addRawToStack(stack, rawPix, w, h);
-                            savedFilename = "frames_stack.tif";
+                            savedFilename = "stack.tif";
                         } else {
                             // WARNING: Saving single files to disk is slow!
                             savedFilename = String.format("frame_%06d.tif", currentFrame);
@@ -226,9 +277,15 @@ public class AcquisitionController {
                         }
                     }
 
-                    // QUEUE 
-                    // If queue is full, returns false (drops frame from processing, but saved above!)
-                    boolean queued = queue.offer(new AcqFrame(rawPix, w, h, currentFrame + 1, savedFilename));
+                    // QUEUE
+                    AcqFrame af = new AcqFrame(rawPix, w, h, currentFrame + 1, savedFilename);
+                    if (params.simulationMode) {
+                        // files can be read much faster than they are localized: wait instead of dropping
+                        while (!stopRequested && !queue.offer(af, 100, TimeUnit.MILLISECONDS)) { /* wait */ }
+                    } else if (!queue.offer(af)) {
+                        // camera must not be stalled: skip localization for this frame (still saved above)
+                        droppedFrames.incrementAndGet();
+                    }
 
                     currentFrame++;
                     updateTimingAndNotifyProgress(currentFrame, params.frames);
@@ -244,7 +301,7 @@ public class AcquisitionController {
             if (stack != null && params.outDir != null) {
                 ImagePlus sImp = new ImagePlus("stack", stack);
                 FileSaver fs = new FileSaver(sImp);
-                String stackPath = new File(params.outDir, "frames_stack.tif").getAbsolutePath();
+                String stackPath = new File(params.outDir, "stack.tif").getAbsolutePath();
                 fs.saveAsTiffStack(stackPath);
             }
 
@@ -287,12 +344,13 @@ public class AcquisitionController {
                 );
 
                 // ACCUMULATE
-                accumulator.initIfNeeded(frame.width, frame.height, params.mag);
+                accumulator.initIfNeeded(frame.width, frame.height, params.mag, params.pixelSizeNm);
                 accumulator.addLocalizations(locs);
 
                 // STORE
                 for (Localization loc : locs) {
-                    csvRows.add(new LocalizationCsvRow(loc.frame, loc.amplitude, loc.x, loc.y, frame.savedFilename));
+                    csvRows.add(new LocalizationCsvRow(loc.frame, loc.amplitude, loc.x, loc.y,
+                            loc.sigmaX, loc.sigmaY, frame.savedFilename));
                 }
 
                 // PREVIEW
@@ -309,69 +367,90 @@ public class AcquisitionController {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception ex) {
-                System.err.println("Processing error: " + ex.getMessage());
+                System.err.println("Processing error: " + ex);
+                if (errorShown.compareAndSet(false, true)) showError("Processing error: " + ex.getMessage());
             }
         }
         accumulator.updateDisplay();
     }
 
     private void finalizeAcquisition(List<LocalizationCsvRow> csvRows, AcquisitionParameters params) {
-        if (progressListener != null) progressListener.closeProgress();
         closeLivePreview();
+        accumulator.updateDisplay(true);   // final refresh; re-opens the window if it was closed mid-run
 
+        StringBuilder saved = new StringBuilder();
         if (params.outDir != null) {
-            File csvFile = new File(params.outDir, "localizations.csv");
-            try (PrintWriter pw = new PrintWriter(new FileWriter(csvFile))) {
-                pw.println("Frame,Amplitude,X,Y,Filename");
-                for (LocalizationCsvRow row : csvRows) {
-                    pw.printf("%d,%.6f,%.6f,%.6f,%s%n", row.frame, row.amp, row.x, row.y, row.filename);
+            File dir = new File(params.outDir);
+
+            if (params.saveCsv) {
+                File csvFile = new File(dir, "localizations.csv");
+                // Frames complete out of order (several worker threads) -> sort chronologically.
+                csvRows.sort(java.util.Comparator.comparingInt(r -> r.frame));
+                final double px = params.pixelSizeNm;
+                try (PrintWriter pw = new PrintWriter(new FileWriter(csvFile))) {
+                    pw.println("id,frame,x [nm],y [nm],sigma1 [nm],sigma2 [nm],intensity [photon]");
+                    int id = 1;
+                    for (LocalizationCsvRow r : csvRows) {
+                        // ThunderSTORM-style names; no redundant filename column.
+                        pw.printf(Locale.ROOT, "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f%n",
+                                id++, r.frame, r.x * px, r.y * px,
+                                r.sigX * px, r.sigY * px, r.amp);
+                    }
+                    saved.append("CSV (").append(csvRows.size()).append(" localizations) ");
+                    try {
+                        // ROI size etc. for the 3D tools (phasor widths depend on the ROI size)
+                        AcquisitionInfo.write(dir, params);
+                    } catch (Exception ex) {
+                        System.err.println("Could not write acquisition info: " + ex.getMessage());
+                    }
+                } catch (Exception ex) {
+                    showError("Failed to write CSV: " + ex.getMessage());
                 }
-                if (studio != null) studio.logs().showMessage("Saved " + csvRows.size() + " localizations.");
-            } catch (Exception ex) {
-                showError("Failed to write CSV: " + ex.getMessage());
+            }
+
+            if (params.saveReconstruction) {
+                File tif = new File(dir, "live_reconstruction.tif");
+                try {
+                    if (accumulator.saveTiff(tif)) saved.append("reconstruction ");
+                    else showError("Reconstruction not saved (nothing was accumulated).");
+                } catch (Exception ex) {
+                    showError("Failed to save reconstruction: " + ex.getMessage());
+                }
             }
         }
-        if (studio != null) studio.alerts().postAlert("SMLM Finished", this.getClass(), "Localizations: " + csvRows.size());
+
+        int dropped = droppedFrames.get();
+        if (dropped > 0) {
+            showError(dropped + " frame(s) were not localized because processing could not keep up "
+                    + "with the camera. Increase the exposure time or reduce the ROI/peak count.");
+        }
+        if (studio != null) {
+            studio.alerts().postAlert("SMLM Finished", this.getClass(),
+                    "Localizations: " + csvRows.size() + (saved.length() > 0 ? "  | saved: " + saved : ""));
+        }
+        if (progressListener != null) progressListener.closeProgress();   // last: re-enables the buttons
     }
 
     // Helpers 
     
+    /**
+     * Append a frame to the stack with its raw pixel values and native bit depth
+     * (previous versions rescaled every frame to 0..65535, which destroyed the intensities).
+     */
     private void addRawToStack(ImageStack stack, Object rawPix, int w, int h) {
-        short[] sPix;
         if (rawPix instanceof short[]) {
-            short[] src = (short[]) rawPix;
-            sPix = new short[w*h];
-            int min = 65535, max = 0;
-            for(short s : src) {
-                int v = s & 0xffff;
-                if(v < min) min = v;
-                if(v > max) max = v;
-            }
-            double range = max - min;
-            if(range <= 0) range = 1.0;
-            for(int i=0; i<src.length; i++) {
-                int val = (int) (((src[i] & 0xffff) - min) / range * 65535.0);
-                sPix[i] = (short)val;
-            }
+            stack.addSlice(new ShortProcessor(w, h, ((short[]) rawPix).clone(), null));
         } else if (rawPix instanceof byte[]) {
-            byte[] src = (byte[]) rawPix;
-            sPix = new short[w*h];
-            for(int i=0; i<src.length; i++) sPix[i] = (short) ((src[i] & 0xff) * 257); 
+            stack.addSlice(new ByteProcessor(w, h, ((byte[]) rawPix).clone(), null));
         } else if (rawPix instanceof double[][]) {
-             double[][] src = (double[][]) rawPix;
-             sPix = new short[w*h];
-             double min = Double.MAX_VALUE, max = -Double.MAX_VALUE;
-             for(double[] r : src) for(double v : r) { if(v<min)min=v; if(v>max)max=v; }
-             double range = max - min; if(range<=0) range=1;
-             int idx=0;
-             for(int y=0; y<h; y++) for(int x=0; x<w; x++) {
-                 int val = (int)((src[y][x] - min)/range * 65535.0);
-                 sPix[idx++] = (short)val;
-             }
+            double[][] src = (double[][]) rawPix;
+            float[] f = new float[w * h];
+            int idx = 0;
+            for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) f[idx++] = (float) src[y][x];
+            stack.addSlice(new FloatProcessor(w, h, f));
         } else {
-            sPix = new short[w*h];
+            stack.addSlice(new ShortProcessor(w, h));
         }
-        stack.addSlice(new ShortProcessor(w, h, sPix, null));
     }
 
     private void saveSingleTiff(Object rawPix, int w, int h, String path) {
@@ -465,9 +544,13 @@ public class AcquisitionController {
     }
 
     private static class LocalizationCsvRow {
-        int frame; double amp, x, y; String filename;
-        LocalizationCsvRow(int frame, double amp, double x, double y, String filename) {
-            this.frame = frame; this.amp = amp; this.x = x; this.y = y; this.filename = filename;
+        final int frame;
+        final double amp, x, y, sigX, sigY;   // x, y, sigX, sigY in camera pixels
+        final String filename;
+        LocalizationCsvRow(int frame, double amp, double x, double y,
+                           double sigX, double sigY, String filename) {
+            this.frame = frame; this.amp = amp; this.x = x; this.y = y;
+            this.sigX = sigX; this.sigY = sigY; this.filename = filename;
         }
     }
 }

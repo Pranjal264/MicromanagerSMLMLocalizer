@@ -8,56 +8,46 @@ import org.scijava.plugin.SciJavaPlugin;
 import javax.swing.*;
 
 /**
- * Entrypoint for Micro-Manager. 
- * This class wires the UI, acquisition controller and the processor.
+ * Entrypoint for Micro-Manager.
+ * Wires the UI, the acquisition controller, the processor and the accumulator.
  */
 @Plugin(type = MenuPlugin.class)
 public class SMLMLocalizer implements MenuPlugin, SciJavaPlugin {
 
     private Studio studio_;
-
-    // the UI and controllers
     private SMLMLocalizerUI ui_;
     private AcquisitionController acqController_;
 
     public SMLMLocalizer() {
-        // nothing here; Studio context arrives in setContext
+        // Studio context arrives in setContext
     }
 
     @Override
     public void setContext(Studio studio) {
         this.studio_ = studio;
-        // Create processor & accumulator
+        wire(studio);
+    }
+
+    /** Create processor, accumulator, controller and UI and connect them. */
+    private void wire(Studio studio) {
         LocalizationProcessor processor = new LocalizationProcessor();
         LocalizationAccumulator accumulator = new LocalizationAccumulator();
 
-        this.ui_ = new SMLMLocalizerUI();
-        // create controller with Studio and wire UI as progress listener
-        this.acqController_ = new AcquisitionController(studio_, processor, accumulator);
-        this.acqController_.setProgressListener(ui_);
-        // wire callbacks
-        ui_.setPreviewCallback(params -> acqController_.preview(params));
-        ui_.setStartCallback(params -> acqController_.startAcquisition(params));
-        ui_.setStopCallback(() -> acqController_.requestStop());
-        ui_.setClearCallback(() -> accumulator.clear());
+        acqController_ = new AcquisitionController(studio, processor, accumulator);
+        ui_ = new SMLMLocalizerUI();
+        acqController_.setProgressListener(ui_);
+
+        final AcquisitionController ctrl = acqController_;
+        ui_.setPreviewCallback(ctrl::preview);
+        ui_.setStartCallback(ctrl::startAcquisition);
+        ui_.setStopCallback(ctrl::requestStop);
+        ui_.setClearCallback(accumulator::clear);
     }
 
     @Override
     public void onPluginSelected() {
-        // show UI on EDT
         SwingUtilities.invokeLater(() -> {
-            if (ui_ == null) {
-                // in case setContext not called (local run), create defaults
-                LocalizationProcessor processor = new LocalizationProcessor();
-                LocalizationAccumulator accumulator = new LocalizationAccumulator();
-                this.acqController_ = new AcquisitionController(null, processor, accumulator);
-                this.ui_ = new SMLMLocalizerUI();
-                this.acqController_.setProgressListener(ui_);
-                ui_.setPreviewCallback(params -> acqController_.preview(params));
-                ui_.setStartCallback(params -> acqController_.startAcquisition(params));
-                ui_.setStopCallback(() -> acqController_.requestStop());
-                ui_.setClearCallback(() -> accumulator.clear());
-            }
+            if (ui_ == null) wire(null);   // setContext not called (local run)
             ui_.show();
         });
     }
@@ -74,7 +64,7 @@ public class SMLMLocalizer implements MenuPlugin, SciJavaPlugin {
 
     @Override
     public String getVersion() {
-        return "0.3 ";
+        return "0.4";
     }
 
     @Override
@@ -87,20 +77,10 @@ public class SMLMLocalizer implements MenuPlugin, SciJavaPlugin {
         return "Acquisition Tools";
     }
 
-    /**
-     * Optional main for local testing (requires ImageJ classes to be on classpath if you try to run).
-     */
+    /** Optional main for local testing (preview/acquire from hardware will report "Studio not available"). */
     public static void main(String[] args) {
         SMLMLocalizer app = new SMLMLocalizer();
-        // create minimal wiring so UI works even when Studio is absent (preview will use errors if executed)
-        LocalizationProcessor processor = new LocalizationProcessor();
-        LocalizationAccumulator accumulator = new LocalizationAccumulator();
-        app.acqController_ = new AcquisitionController(null, processor, accumulator);
-        app.ui_ = new SMLMLocalizerUI();
-        app.ui_.setPreviewCallback(params -> app.acqController_.preview(params));
-        app.ui_.setStartCallback(params -> app.acqController_.startAcquisition(params));
-        app.ui_.setStopCallback(() -> app.acqController_.requestStop());
-        app.ui_.setClearCallback(accumulator::clear);
+        app.wire(null);
         SwingUtilities.invokeLater(app.ui_::show);
     }
 }

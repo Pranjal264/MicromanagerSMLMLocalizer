@@ -1,128 +1,207 @@
 package org.micromanager.smlm;
 
+import ij.ImageListener;
 import ij.ImagePlus;
-import ij.process.FloatProcessor;
+import ij.io.FileSaver;
+import ij.measure.Calibration;
 import ij.plugin.ContrastEnhancer;
+import ij.process.FloatProcessor;
 
-import javax.swing.*;
+import javax.swing.SwingUtilities;
+import java.io.File;
+import java.util.Arrays;
 import java.util.List;
 
 /**
- * NOTE: coordinates from Localization are in image pixels. This accumulator multiplies
- * coordinates by the configured 'mag' when mapping into the cumulative (magnified) canvas.
+ * Accumulates localizations into a magnified histogram image.
+ *
+ * Design notes (this is what fixes the "histogram window never comes back" bug):
+ *  - The counts live in our own float[] and are never owned by an ImagePlus. When the
+ *    user closes the ImageJ window, ImageJ may release the processor's pixels; our data
+ *    is unaffected.
+ *  - Whether the window is open is checked every time we draw, and a fresh ImagePlus is
+ *    created around the same float[] when it is not. No "displayCreated" flag to go stale.
+ *  - If the user closes the window during a run it stays closed (periodic updates do not
+ *    keep re-opening it), but a new acquisition and the final update bring it back.
+ *
+ * Localization x/y are in camera pixels; they are multiplied by 'mag' to index the canvas.
  */
 public class LocalizationAccumulator {
 
-    private FloatProcessor cumulativeFP;
-    private ImagePlus cumulativeImp;
-    private volatile boolean displayCreated = false;
-    private volatile float runningMax = 1.0f;
+    /** Refuse canvases larger than this many pixels (~1 GB of floats). */
+    private static final long MAX_CANVAS_PIXELS = 1L << 28;
+
     private final Object lock = new Object();
 
-    // stored canvas geometry + magnification
-    private int camW = -1;
-    private int camH = -1;
-    private int mag = 1;
+    // ---- data (guarded by lock) ----
+    private float[] data;
+    private int width = -1, height = -1;       // magnified canvas size
+    private int camW = -1, camH = -1, mag = 1;
+    private double pixelSizeNm = 0.0;
 
+    // ---- display (touched on the EDT) ----
+    private volatile ImagePlus imp;
+    private volatile boolean suppressed = false; // true after the user closed the window
+
+    private final ImageListener closeListener = new ImageListener() {
+        @Override public void imageOpened(ImagePlus i) { }
+        @Override public void imageUpdated(ImagePlus i) { }
+        @Override public void imageClosed(ImagePlus i) {
+            if (i != null && i == imp) {
+                imp = null;
+                suppressed = true;
+            }
+        }
+    };
+
+    public LocalizationAccumulator() {
+        ImagePlus.addImageListener(closeListener);
+    }
+
+    /** Drop everything (data and window reference). */
     public void reset() {
         synchronized (lock) {
-            cumulativeFP = null;
-            cumulativeImp = null;
-            displayCreated = false;
-            runningMax = 1.0f;
-            camW = camH = -1;
+            data = null;
+            width = height = camW = camH = -1;
             mag = 1;
         }
+        suppressed = false;
+    }
+
+    /** Call at the start of every acquisition: zero the counts and allow the window to open. */
+    public void beginAcquisition() {
+        synchronized (lock) {
+            if (data != null) Arrays.fill(data, 0f);
+        }
+        suppressed = false;
     }
 
     /**
-     * Initialize accumulator if not created. Stores camW/camH and magnification.
-     * If magnification or cam size changed since last init, recreate the accumulator.
+     * Allocate the canvas if needed (or if camera size / magnification changed).
+     * @throws IllegalStateException if the requested canvas is unreasonably large
      */
-    public void initIfNeeded(int camW, int camH, int mag) {
+    public void initIfNeeded(int camW, int camH, int mag, double pixelSizeNm) {
         synchronized (lock) {
-            boolean needCreate = false;
-            if (cumulativeFP == null) {
-                needCreate = true;
-            } else if (this.camW != camW || this.camH != camH || this.mag != mag) {
-                // geometry changed — recreate accumulator
-                needCreate = true;
+            int m = Math.max(1, mag);
+            this.pixelSizeNm = pixelSizeNm;
+            if (data != null && this.camW == camW && this.camH == camH && this.mag == m) return;
+
+            long cw = (long) camW * m, ch = (long) camH * m;
+            if (cw * ch > MAX_CANVAS_PIXELS) {
+                throw new IllegalStateException("Reconstruction canvas too large (" + cw + " x " + ch
+                        + " px). Reduce the magnification.");
             }
-            if (needCreate) {
-                this.camW = camW;
-                this.camH = camH;
-                this.mag = Math.max(1, mag);
-                int cumulW = camW * this.mag;
-                int cumulH = camH * this.mag;
-                cumulativeFP = new FloatProcessor(cumulW, cumulH);
-                cumulativeImp = new ImagePlus("Localizations (mag=" + this.mag + ")", cumulativeFP);
-                runningMax = 1.0f;
-                displayCreated = false;
-            }
+            this.camW = camW;
+            this.camH = camH;
+            this.mag = m;
+            this.width = (int) cw;
+            this.height = (int) ch;
+            this.data = new float[this.width * this.height];
         }
     }
 
-    /**
-     * Add a list of localizations into the accumulator.
-     * Each Localization.x/y are in image coordinates (pixels). They are multiplied by 'mag'
-     * and rounded to nearest integer before being used as indices in the cumulative image.
-     */
+    /** Add localizations (image-pixel coordinates). Safe to call from several threads. */
     public void addLocalizations(List<Localization> locs) {
         if (locs == null || locs.isEmpty()) return;
         synchronized (lock) {
-            if (cumulativeFP == null) return;
-            final int w = cumulativeFP.getWidth();
-            final int h = cumulativeFP.getHeight();
-            final int currentMag = this.mag;
+            if (data == null) return;
+            final int w = width, h = height, m = mag;
             for (Localization L : locs) {
-                // Multiply by mag to map from image coords -> magnified canvas coords
-                int ix = (int) Math.round(L.x * currentMag);
-                int iy = (int) Math.round(L.y * currentMag);
+                int ix = (int) Math.round(L.x * m);
+                int iy = (int) Math.round(L.y * m);
                 if (ix >= 0 && ix < w && iy >= 0 && iy < h) {
-                    float cur = cumulativeFP.getf(ix, iy);
-                    cur += 1.0f;
-                    cumulativeFP.setf(ix, iy, cur);
-                    if (cur > runningMax) runningMax = cur;
+                    data[iy * w + ix] += 1.0f;
                 }
             }
         }
     }
 
-    /**
-     * Update the ImageJ display on the EDT. Shows the window first time, then updates.
-     */
-    public void updateDisplay() {
-        synchronized (lock) {
-            if (cumulativeImp == null) return;
-            final float vmax = runningMax;
-            SwingUtilities.invokeLater(() -> {
-                if (!displayCreated) {
-                    cumulativeImp.show();
-                    displayCreated = true;
-                } else {
-                    cumulativeImp.updateAndDraw();
-                }
-                try {
-//                    cumulativeImp.getProcessor().setMinAndMax(0, Math.max(1.0, vmax));
-//                    cumulativeImp.getProcessor().resetMinAndMax();
-                    new ContrastEnhancer().stretchHistogram(cumulativeImp, 0.5);
-                } catch (Exception ignore) {}
-                cumulativeImp.updateAndDraw();
-            });
-        }
-    }
+    /** Periodic refresh: does not re-open a window the user closed. */
+    public void updateDisplay() { updateDisplay(false); }
 
     /**
-     * Clears the accumulator (sets all pixels to zero) and resets running max.
+     * Refresh the display on the EDT, creating the window if it is not open.
+     * @param forceShow open the window even if the user closed it earlier in this run
      */
+    public void updateDisplay(boolean forceShow) {
+        final float[] d;
+        final int w, h, m;
+        final double px;
+        synchronized (lock) {
+            if (data == null) return;
+            d = data; w = width; h = height; m = mag; px = pixelSizeNm;
+        }
+        SwingUtilities.invokeLater(() -> {
+            boolean open = isWindowOpen();
+            if (!open) {
+                if (suppressed && !forceShow) return;
+                suppressed = false;
+                ImagePlus created = new ImagePlus(title(m), new FloatProcessor(w, h, d));
+                applyCalibration(created, m, px);
+                imp = created;
+                created.show();
+            } else {
+                ImagePlus cur = imp;
+                if (cur.getWidth() != w || cur.getHeight() != h || cur.getProcessor().getPixels() != d) {
+                    cur.setProcessor(title(m), new FloatProcessor(w, h, d));
+                    applyCalibration(cur, m, px);
+                }
+            }
+            ImagePlus cur = imp;
+            if (cur == null) return;
+            try {
+                new ContrastEnhancer().stretchHistogram(cur, 0.5);
+            } catch (Exception ignore) { }
+            cur.updateAndDraw();
+        });
+    }
+
+    /** Zero the counts (the "Clear histogram" button). */
     public void clear() {
         synchronized (lock) {
-            if (cumulativeFP != null) {
-                float[] px = (float[]) cumulativeFP.getPixels();
-                for (int i = 0; i < px.length; i++) px[i] = 0f;
-                runningMax = 1.0f;
-            }
-            if (cumulativeImp != null) SwingUtilities.invokeLater(cumulativeImp::updateAndDraw);
+            if (data != null) Arrays.fill(data, 0f);
+        }
+        SwingUtilities.invokeLater(() -> {
+            ImagePlus cur = imp;
+            if (cur != null && isWindowOpen()) cur.updateAndDraw();
+        });
+    }
+
+    /**
+     * Save the reconstruction as a 32-bit TIFF. The pixel calibration is written in nm
+     * (pixelSize / mag per histogram pixel) so Fiji reports real units.
+     * Works whether or not the display window is open.
+     */
+    public boolean saveTiff(File file) {
+        final float[] d;
+        final int w, h, m;
+        final double px;
+        synchronized (lock) {
+            if (data == null) return false;
+            d = data; w = width; h = height; m = mag; px = pixelSizeNm;
+        }
+        ImagePlus out = new ImagePlus(title(m), new FloatProcessor(w, h, d));
+        applyCalibration(out, m, px);
+        return new FileSaver(out).saveAsTiff(file.getAbsolutePath());
+    }
+
+    // ---- helpers ----
+
+    private boolean isWindowOpen() {
+        ImagePlus cur = imp;
+        return cur != null && cur.getWindow() != null && !cur.getWindow().isClosed();
+    }
+
+    private static String title(int mag) {
+        return "Localizations (mag=" + mag + ")";
+    }
+
+    private static void applyCalibration(ImagePlus target, int mag, double pixelSizeNm) {
+        if (pixelSizeNm > 0) {
+            Calibration c = target.getCalibration();
+            c.pixelWidth = pixelSizeNm / mag;
+            c.pixelHeight = pixelSizeNm / mag;
+            c.setUnit("nm");
         }
     }
 }
